@@ -86,7 +86,11 @@ Add to your Cline MCP settings (usually in `~/.vscode/globalStorage/saoudrizwan.
 
 ## Tool Usage
 
-The server provides a single tool `generate_response` with the following parameters:
+The server provides two tools for generating and monitoring responses:
+
+### generate_response
+
+Main tool for generating responses with the following parameters:
 
 ```typescript
 {
@@ -97,17 +101,57 @@ The server provides a single tool `generate_response` with the following paramet
 }
 ```
 
+### check_response_status
+
+Tool for checking the status of a response generation task:
+
+```typescript
+{
+  "taskId": string  // Required: The task ID from generate_response
+}
+```
+
+### Response Polling
+
+The server uses a polling mechanism to handle long-running requests:
+
+1. Initial Request:
+   - `generate_response` returns immediately with a task ID
+   - Response format: `{"taskId": "uuid-here"}`
+
+2. Status Checking:
+   - Use `check_response_status` to poll the task status
+   - **Note:** Responses can take up to 60 seconds to complete
+   - Status progresses through: pending → reasoning → responding → complete
+
 Example usage in Cline:
 ```typescript
-use_mcp_tool({
+// Initial request
+const result = await use_mcp_tool({
   server_name: "deepseek-claude",
   tool_name: "generate_response",
   arguments: {
-    prompt: "What is Python?",
-    showReasoning: true,
-    includeHistory: true
+    prompt: "What is quantum computing?",
+    showReasoning: true
   }
 });
+
+// Get taskId from result
+const taskId = JSON.parse(result.content[0].text).taskId;
+
+// Poll for status (may need multiple checks over ~60 seconds)
+const status = await use_mcp_tool({
+  server_name: "deepseek-claude",
+  tool_name: "check_response_status",
+  arguments: { taskId }
+});
+
+// Example status response when complete:
+{
+  "status": "complete",
+  "reasoning": "...",  // If showReasoning was true
+  "response": "..."    // The final response
+}
 ```
 
 ## Development
