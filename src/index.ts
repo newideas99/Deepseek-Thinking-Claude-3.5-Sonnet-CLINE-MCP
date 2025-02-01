@@ -12,6 +12,7 @@ import dotenv from 'dotenv';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { v4 as uuidv4 } from 'uuid';
 
 // Load environment variables
 dotenv.config();
@@ -47,6 +48,25 @@ interface GenerateResponseArgs {
   clearContext?: boolean;
   includeHistory?: boolean;
 }
+
+interface CheckResponseStatusArgs {
+  taskId: string;
+}
+
+interface TaskStatus {
+  status: 'pending' | 'reasoning' | 'responding' | 'complete' | 'error';
+  prompt: string;
+  showReasoning?: boolean;
+  reasoning?: string;
+  response?: string;
+  error?: string;
+  timestamp: number;
+}
+
+const isValidCheckResponseStatusArgs = (args: any): args is CheckResponseStatusArgs =>
+  typeof args === 'object' &&
+  args !== null &&
+  typeof args.taskId === 'string';
 
 interface ClaudeMessage {
   role: 'user' | 'assistant';
@@ -134,11 +154,11 @@ async function findActiveConversation(): Promise<ClaudeMessage[] | null> {
 }
 
 function formatHistoryForModel(history: ClaudeMessage[], isDeepSeek: boolean): string {
-  let totalLength = 0;
   const maxLength = isDeepSeek ? 50000 : 600000; // 50k chars for DeepSeek, 600k for Claude
   const formattedMessages = [];
+  let totalLength = 0;
   
-  // Process messages from most recent to oldest
+  // Process messages in reverse chronological order to get most recent first
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
     const content = Array.isArray(msg.content)
@@ -153,11 +173,12 @@ function formatHistoryForModel(history: ClaudeMessage[], isDeepSeek: boolean): s
       break;
     }
     
-    formattedMessages.unshift(formattedMsg); // Add to start to maintain order
+    formattedMessages.push(formattedMsg); // Add most recent messages first
     totalLength += msgLength;
   }
   
-  return formattedMessages.join('\n\n');
+  // Reverse to get chronological order
+  return formattedMessages.reverse().join('\n\n');
 }
 
 class DeepseekClaudeServer {
@@ -167,6 +188,7 @@ class DeepseekClaudeServer {
     entries: [],
     maxEntries: 10
   };
+  private activeTasks: Map<string, TaskStatus> = new Map();
 
   constructor() {
     log('Initializing API clients...');
@@ -245,76 +267,174 @@ class DeepseekClaudeServer {
             },
             required: ['prompt']
           }
+        },
+        {
+          name: 'check_response_status',
+          description: 'Check the status of a response generation task',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: {
+                type: 'string',
+                description: 'The task ID returned by generate_response'
+              }
+            },
+            required: ['taskId']
+          }
         }
       ]
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      if (request.params.name !== 'generate_response') {
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${request.params.name}`
-        );
-      }
-
-      if (!isValidGenerateResponseArgs(request.params.arguments)) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          'Invalid generate_response arguments'
-        );
-      }
-
-      try {
-        if (request.params.arguments.clearContext) {
-          this.context.entries = [];
+      if (request.params.name === 'generate_response') {
+        if (!isValidGenerateResponseArgs(request.params.arguments)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            'Invalid generate_response arguments'
+          );
         }
 
-        // Get Cline conversation history if requested
-        let history: ClaudeMessage[] | null = null;
-        if (request.params.arguments.includeHistory !== false) {
-          history = await findActiveConversation();
-        }
+        const taskId = uuidv4();
+        const { prompt, showReasoning, clearContext, includeHistory } = request.params.arguments;
 
-        // Get DeepSeek reasoning with limited history
-        const reasoningHistory = history ? formatHistoryForModel(history, true) : '';
-        const reasoningPrompt = reasoningHistory 
-          ? `${reasoningHistory}\n\nNew question: ${request.params.arguments.prompt}`
-          : request.params.arguments.prompt;
-        const reasoning = await this.getDeepseekReasoning(reasoningPrompt);
-        
-        // Get final response with full history
-        const responseHistory = history ? formatHistoryForModel(history, false) : '';
-        const fullPrompt = responseHistory 
-          ? `${responseHistory}\n\nCurrent task: ${request.params.arguments.prompt}`
-          : request.params.arguments.prompt;
-        const response = await this.getFinalResponse(fullPrompt, reasoning);
-
-        // Add to context after successful response
-        this.addToContext({
-          timestamp: Date.now(),
-          prompt: request.params.arguments.prompt,
-          reasoning,
-          response,
-          model: CLAUDE_MODEL
+        // Initialize task status
+        this.activeTasks.set(taskId, {
+          status: 'pending',
+          prompt,
+          showReasoning,
+          timestamp: Date.now()
         });
+
+        // Start processing in background
+        this.processTask(taskId, clearContext, includeHistory).catch(error => {
+          log('Error processing task:', error);
+          this.activeTasks.set(taskId, {
+            ...this.activeTasks.get(taskId)!,
+            status: 'error',
+            error: error.message
+          });
+        });
+
+        // Return task ID immediately
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ taskId })
+            }
+          ]
+        };
+      } else if (request.params.name === 'check_response_status') {
+        if (!isValidCheckResponseStatusArgs(request.params.arguments)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            'Invalid check_response_status arguments'
+          );
+        }
+
+        const taskId = request.params.arguments.taskId;
+        const task = this.activeTasks.get(taskId);
+
+        if (!task) {
+          throw new McpError(
+            ErrorCode.InvalidRequest,
+            `No task found with ID: ${taskId}`
+          );
+        }
 
         return {
           content: [
             {
               type: 'text',
-              text: request.params.arguments.showReasoning
-                ? `Reasoning:\n${reasoning}\n\nResponse:\n${response}`
-                : response
+              text: JSON.stringify({
+                status: task.status,
+                reasoning: task.showReasoning ? task.reasoning : undefined,
+                response: task.status === 'complete' ? task.response : undefined,
+                error: task.error
+              })
             }
           ]
         };
-      } catch (error) {
-        if (error instanceof Error) {
-          throw new McpError(ErrorCode.InternalError, error.message);
-        }
-        throw error;
+      } else {
+        throw new McpError(
+          ErrorCode.MethodNotFound,
+          `Unknown tool: ${request.params.name}`
+        );
       }
     });
+  }
+
+  private async processTask(taskId: string, clearContext?: boolean, includeHistory?: boolean): Promise<void> {
+    const task = this.activeTasks.get(taskId);
+    if (!task) {
+      throw new Error(`No task found with ID: ${taskId}`);
+    }
+    
+    try {
+      if (clearContext) {
+        this.context.entries = [];
+      }
+
+      // Update status to reasoning
+      this.activeTasks.set(taskId, {
+        ...task,
+        status: 'reasoning'
+      });
+
+      // Get Cline conversation history if requested
+      let history: ClaudeMessage[] | null = null;
+      if (includeHistory !== false) {
+        history = await findActiveConversation();
+      }
+
+      // Get DeepSeek reasoning with limited history
+      const reasoningHistory = history ? formatHistoryForModel(history, true) : '';
+      const reasoningPrompt = reasoningHistory 
+        ? `${reasoningHistory}\n\nNew question: ${task.prompt}`
+        : task.prompt;
+      const reasoning = await this.getDeepseekReasoning(reasoningPrompt);
+
+      // Update status with reasoning
+      this.activeTasks.set(taskId, {
+        ...task,
+        status: 'responding',
+        reasoning
+      });
+
+      // Get final response with full history
+      const responseHistory = history ? formatHistoryForModel(history, false) : '';
+      const fullPrompt = responseHistory 
+        ? `${responseHistory}\n\nCurrent task: ${task.prompt}`
+        : task.prompt;
+      const response = await this.getFinalResponse(fullPrompt, reasoning);
+
+      // Add to context after successful response
+      this.addToContext({
+        timestamp: Date.now(),
+        prompt: task.prompt,
+        reasoning,
+        response,
+        model: CLAUDE_MODEL
+      });
+
+      // Update status to complete
+      this.activeTasks.set(taskId, {
+        ...task,
+        status: 'complete',
+        reasoning,
+        response,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      // Update status to error
+      this.activeTasks.set(taskId, {
+        ...task,
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: Date.now()
+      });
+      throw error;
+    }
   }
 
   private async getDeepseekReasoning(prompt: string): Promise<string> {
@@ -323,17 +443,16 @@ class DeepseekClaudeServer {
       : prompt;
 
     try {
-      // Ask DeepSeek to think but only output 'done'
+      // Get reasoning from DeepSeek
       const response = await this.openrouterClient.chat.completions.create({
         model: DEEPSEEK_MODEL,
         messages: [{ 
           role: "user", 
-          content: `${contextPrompt} Please think this through, but don't output an answer -- only think about the problem, and output 'done'.`
+          content: contextPrompt
         }],
         include_reasoning: true,
         temperature: 0.7,
-        top_p: 1,
-        repetition_penalty: 1
+        top_p: 1
       } as any);
 
       // Get reasoning from response
