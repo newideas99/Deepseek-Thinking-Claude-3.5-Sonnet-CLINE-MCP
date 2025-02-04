@@ -360,7 +360,7 @@ class DeepseekClaudeServer {
         }
 
         // Otherwise, wait for either a status change or timeout
-        const POLL_DELAY_MS = 5000; // 5 second delay
+        const POLL_DELAY_MS = 10000; // 10 second delay
         const initialStatus = task.status;
         
         try {
