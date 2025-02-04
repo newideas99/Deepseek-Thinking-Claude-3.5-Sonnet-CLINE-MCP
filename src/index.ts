@@ -1,18 +1,13 @@
 #!/usr/bin/env node
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ErrorCode,
-  ListToolsRequestSchema,
-  McpError,
-} from '@modelcontextprotocol/sdk/types.js';
 import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { v4 as uuidv4 } from 'uuid';
+import { z } from 'zod';
 
 // Load environment variables
 dotenv.config();
@@ -42,16 +37,21 @@ interface ConversationContext {
   maxEntries: number;
 }
 
-interface GenerateResponseArgs {
-  prompt: string;
-  showReasoning?: boolean;
-  clearContext?: boolean;
-  includeHistory?: boolean;
-}
+// Define types for the tool arguments
+type GenerateResponseArgs = z.infer<typeof generateResponseSchema>;
+type CheckResponseStatusArgs = z.infer<typeof checkResponseStatusSchema>;
 
-interface CheckResponseStatusArgs {
-  taskId: string;
-}
+// Define the schemas outside the class so they can be used in type definitions
+const generateResponseSchema = z.object({
+  prompt: z.string(),
+  showReasoning: z.boolean().optional(),
+  clearContext: z.boolean().optional(),
+  includeHistory: z.boolean().optional()
+});
+
+const checkResponseStatusSchema = z.object({
+  taskId: z.string()
+});
 
 interface TaskStatus {
   status: 'pending' | 'reasoning' | 'responding' | 'complete' | 'error';
@@ -182,7 +182,7 @@ function formatHistoryForModel(history: ClaudeMessage[], isDeepSeek: boolean): s
 }
 
 class DeepseekClaudeServer {
-  private server: Server;
+  private server: McpServer;
   private openrouterClient: OpenAI;
   private context: ConversationContext = {
     entries: [],
@@ -201,22 +201,25 @@ class DeepseekClaudeServer {
     log('OpenRouter client initialized');
 
     // Initialize MCP server
-    this.server = new Server(
-      {
-        name: 'deepseek-thinking-claude-mcp',
-        version: '0.1.0',
-      },
-      {
-        capabilities: {
-          tools: {},
+    this.server = new McpServer({
+      name: 'deepseek-thinking-claude-mcp',
+      version: '0.1.0',
+      tools: [
+        {
+          name: 'generate_response',
+          description: 'Generate a response using DeepSeek\'s reasoning and Claude\'s response generation through OpenRouter.',
+          schema: generateResponseSchema,
+          handler: this.handleGenerateResponse.bind(this)
         },
-      }
-    );
+        {
+          name: 'check_response_status',
+          description: 'Check the status of a response generation task',
+          schema: checkResponseStatusSchema,
+          handler: this.handleCheckResponseStatus.bind(this)
+        }
+      ]
+    });
 
-    this.setupToolHandlers();
-    
-    // Error handling
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
     process.on('SIGINT', async () => {
       await this.server.close();
       process.exit(0);
@@ -236,132 +239,46 @@ class DeepseekClaudeServer {
       .join('\n\n');
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'generate_response',
-          description: 'Generate a response using DeepSeek\'s reasoning and Claude\'s response generation through OpenRouter.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              prompt: {
-                type: 'string',
-                description: 'The user\'s input prompt'
-              },
-              showReasoning: {
-                type: 'boolean',
-                description: 'Whether to include reasoning in response',
-                default: false
-              },
-              clearContext: {
-                type: 'boolean',
-                description: 'Clear conversation history before this request',
-                default: false
-              },
-              includeHistory: {
-                type: 'boolean',
-                description: 'Include Cline conversation history for context',
-                default: true
-              }
-            },
-            required: ['prompt']
-          }
-        },
-        {
-          name: 'check_response_status',
-          description: 'Check the status of a response generation task',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              taskId: {
-                type: 'string',
-                description: 'The task ID returned by generate_response'
-              }
-            },
-            required: ['taskId']
-          }
-        }
-      ]
-    }));
+  private async handleGenerateResponse(args: GenerateResponseArgs) {
+    const taskId = uuidv4();
+    const { prompt, showReasoning, clearContext, includeHistory } = args;
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      if (request.params.name === 'generate_response') {
-        if (!isValidGenerateResponseArgs(request.params.arguments)) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'Invalid generate_response arguments'
-          );
-        }
-
-        const taskId = uuidv4();
-        const { prompt, showReasoning, clearContext, includeHistory } = request.params.arguments;
-
-        // Initialize task status
-        this.activeTasks.set(taskId, {
-          status: 'pending',
-          prompt,
-          showReasoning,
-          timestamp: Date.now()
-        });
-
-        // Start processing in background
-        this.processTask(taskId, clearContext, includeHistory).catch(error => {
-          log('Error processing task:', error);
-          this.activeTasks.set(taskId, {
-            ...this.activeTasks.get(taskId)!,
-            status: 'error',
-            error: error.message
-          });
-        });
-
-        // Return task ID immediately
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({ taskId })
-            }
-          ]
-        };
-      } else if (request.params.name === 'check_response_status') {
-        if (!isValidCheckResponseStatusArgs(request.params.arguments)) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'Invalid check_response_status arguments'
-          );
-        }
-
-        const taskId = request.params.arguments.taskId;
-        const task = this.activeTasks.get(taskId);
-
-        if (!task) {
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `No task found with ID: ${taskId}`
-          );
-        }
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                status: task.status,
-                reasoning: task.showReasoning ? task.reasoning : undefined,
-                response: task.status === 'complete' ? task.response : undefined,
-                error: task.error
-              })
-            }
-          ]
-        };
-      } else {
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${request.params.name}`
-        );
-      }
+    // Initialize task status
+    this.activeTasks.set(taskId, {
+      status: 'pending',
+      prompt,
+      showReasoning,
+      timestamp: Date.now()
     });
+
+    // Start processing in background
+    this.processTask(taskId, clearContext, includeHistory).catch(error => {
+      log('Error processing task:', error);
+      this.activeTasks.set(taskId, {
+        ...this.activeTasks.get(taskId)!,
+        status: 'error',
+        error: error.message
+      });
+    });
+
+    // Return task ID immediately
+    return { taskId };
+  }
+
+  private async handleCheckResponseStatus(args: CheckResponseStatusArgs) {
+    const taskId = args.taskId;
+    const task = this.activeTasks.get(taskId);
+
+    if (!task) {
+      throw new Error(`No task found with ID: ${taskId}`);
+    }
+
+    return {
+      status: task.status,
+      reasoning: task.showReasoning ? task.reasoning : undefined,
+      response: task.status === 'complete' ? task.response : undefined,
+      error: task.error
+    };
   }
 
   private async processTask(taskId: string, clearContext?: boolean, includeHistory?: boolean): Promise<void> {

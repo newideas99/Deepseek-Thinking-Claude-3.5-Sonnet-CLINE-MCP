@@ -17,15 +17,15 @@
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.36.2",
-    "@modelcontextprotocol/sdk": "0.6.0",
+    "@anthropic-ai/sdk": "^0.36.3",
+    "@modelcontextprotocol/sdk": "^1.4.1",
     "dotenv": "^16.4.7",
-    "openai": "^4.80.1",
+    "openai": "^4.82.0",
     "uuid": "^11.0.5"
   },
   "devDependencies": {
-    "@types/node": "^20.11.24",
+    "@types/node": "^22.13.1",
     "@types/uuid": "^10.0.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.7.3"
   }
 }
