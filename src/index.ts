@@ -273,11 +273,61 @@ class DeepseekClaudeServer {
       throw new Error(`No task found with ID: ${taskId}`);
     }
 
+    // If task is in a final state (complete or error), return immediately
+    if (['complete', 'error'].includes(task.status)) {
+      return {
+        status: task.status,
+        reasoning: task.showReasoning ? task.reasoning : undefined,
+        response: task.status === 'complete' ? task.response : undefined,
+        error: task.error
+      };
+    }
+
+    // Otherwise, wait for either a status change or timeout
+    const POLL_DELAY_MS = 10000; // 10 second delay
+    const initialStatus = task.status;
+    
+    try {
+      await new Promise((resolve, reject) => {
+        const checkInterval = setInterval(() => {
+          const currentTask = this.activeTasks.get(taskId);
+          if (!currentTask) {
+            clearInterval(checkInterval);
+            reject(new Error(`Task ${taskId} no longer exists`));
+            return;
+          }
+
+          // Resolve if status changed or reached final state
+          if (currentTask.status !== initialStatus || 
+              currentTask.status === 'complete' || 
+              currentTask.status === 'error') {
+            clearInterval(checkInterval);
+            resolve(true);
+          }
+        }, 100); // Check every 100ms for changes
+
+        // Set timeout to resolve after POLL_DELAY_MS
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          resolve(false);
+        }, POLL_DELAY_MS);
+      });
+    } catch (error) {
+      log('Error during status check:', error);
+      throw error;
+    }
+
+    // Get final task state after waiting
+    const finalTask = this.activeTasks.get(taskId);
+    if (!finalTask) {
+      throw new Error(`Task ${taskId} no longer exists`);
+    }
+
     return {
-      status: task.status,
-      reasoning: task.showReasoning ? task.reasoning : undefined,
-      response: task.status === 'complete' ? task.response : undefined,
-      error: task.error
+      status: finalTask.status,
+      reasoning: finalTask.showReasoning ? finalTask.reasoning : undefined,
+      response: finalTask.status === 'complete' ? finalTask.response : undefined,
+      error: finalTask.error
     };
   }
 
